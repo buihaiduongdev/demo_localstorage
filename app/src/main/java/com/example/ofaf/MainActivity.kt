@@ -41,6 +41,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
+import kotlin.math.pow
 
 // KEY-VALUE
 val Context.dataStore by preferencesDataStore(name = "performance_settings")
@@ -71,10 +72,26 @@ data class Review(
     val comment: String // Bình luận dài
 )
 
+//STRUCTURED DATA MODELS FOR ROOM
+data class HotelWithDetails(
+    @Embedded val hotel: Hotel,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "hotelId"
+    )
+    val roomTypes: List<RoomType>,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "hotelId"
+    )
+    val reviews: List<Review>
+)
+
 @Dao
 interface HotelDao {
+    @Transaction
     @Query("SELECT * FROM hotels WHERE price < 1000000")
-    suspend fun getCheapRooms(): List<Hotel>
+    suspend fun getCheapHotelsWithDetails(): List<HotelWithDetails>
     
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertHotels(hotels: List<Hotel>)
@@ -85,10 +102,9 @@ interface HotelDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertReviews(reviews: List<Review>)
 
-    @Query("DELETE FROM hotels")
-    suspend fun deleteAllHotels()
 }
 
+//ROOM
 @Database(entities = [Hotel::class, RoomType::class, Review::class], version = 1)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun hotelDao(): HotelDao
@@ -96,25 +112,24 @@ abstract class AppDatabase : RoomDatabase() {
 
 data class HotelComplex(
     val hotel: Hotel,
-    val roomTypes: List<String>,
-    val reviews: List<String>
+    val roomTypes: List<RoomType>,
+    val reviews: List<Review>
 )
 
+//QUEUE
 class SyncFavoriteWorker(appContext: Context, workerParams: WorkerParameters) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result {
         delay(1000)
         
         val attempt = runAttemptCount
-        if (attempt < 2) {
+        if (attempt < 3) {
             return Result.retry()
         }
         return Result.success()
     }
 }
 
-// =====================================================================
-// 4. VIEWMODEL
-// =====================================================================
+
 class DemoViewModel(
     private val hotelDao: HotelDao,
     private val context: Context,
@@ -159,13 +174,32 @@ class DemoViewModel(
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            hotelDao.deleteAllHotels()
-            val longDesc = "Mô tả cực kỳ dài... ".repeat(20)
-            val samples = List(10000) { i ->
-                Hotel(i.toString(), "Hotel $i", (500000..1500000).random(), longDesc)
+
+            addLog("Đang chuẩn bị 10,000 Hotel ngẫu nhiên trên Disk (vui lòng đợi)...")
+            val startTime = System.currentTimeMillis()
+            
+            // Đồng bộ lên 10,000 khách sạn cho Room với dữ liệu ngẫu nhiên cực nặng
+            val hotels = mutableListOf<Hotel>()
+            val types = mutableListOf<RoomType>()
+            val reviews = mutableListOf<Review>()
+
+            repeat(10000) { i ->
+                val uniqueStr = UUID.randomUUID().toString() + " ".repeat(1000)
+                val hId = UUID.randomUUID().toString()
+                
+                val hotel = Hotel(hId, "Hotel $i", (500000..1500000).random(), uniqueStr)
+                hotels.add(hotel)
+                
+                repeat(3) { types.add(RoomType(hotelId = hId, typeName = "Type $it", info = uniqueStr)) }
+                repeat(5) { reviews.add(Review(hotelId = hId, user = "User $it", comment = uniqueStr)) }
             }
-            hotelDao.insertHotels(samples)
-            addLog("Đã chuẩn bị 10,000 khách sạn trên Disk.")
+
+            hotelDao.insertHotels(hotels)
+            hotelDao.insertRoomTypes(types)
+            hotelDao.insertReviews(reviews)
+            
+            val endTime = System.currentTimeMillis()
+            addLog("Xong! Đã lưu 90,000 bản ghi ĐỘC LẬP vào Room trong ${endTime - startTime}ms.")
         }
 
         // Hiện thực Lazy Write: Gom các thay đổi và đồng bộ sau 3 giây không có thay đổi mới (Debounce)
@@ -183,48 +217,6 @@ class DemoViewModel(
                     }
                 }
         }
-    }
-
-    // 1. Online-only Write: Chỉ cho phép khi có mạng
-    fun onlineOnlyWritePayment() {
-        viewModelScope.launch {
-            if (checkOnline()) {
-                addLog("Online-only: Đang xử lý thanh toán...")
-                delay(1500)
-                addLog("Thành công: Đã thanh toán trực tuyến.")
-            } else {
-                addLog("Lỗi: Không có mạng. Tác vụ thanh toán bị hủy để bảo mật.")
-            }
-        }
-    }
-
-    // 2. Queued Write with Exponential Backoff
-    fun writeStrategyQueued() {
-        // Hủy worker cũ nếu có để demo lại từ đầu
-        workManager.cancelAllWorkByTag("sync_demo")
-
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-
-        val work = OneTimeWorkRequestBuilder<SyncFavoriteWorker>()
-            .setConstraints(constraints)
-            .addTag("sync_demo")
-            .setBackoffCriteria(
-                BackoffPolicy.EXPONENTIAL,
-                5,
-                TimeUnit.SECONDS
-            )
-            .build()
-
-        workManager.enqueue(work)
-        addLog("Queued: Đã bắt đầu Task với Exponential Backoff (5s, 10s, 20s...).")
-    }
-
-    fun updateVideoProgress(progress: Float) {
-        videoProgress.value = progress
-        // Lưu local ngay lập tức (nhanh)
-        // syncToServer sẽ được xử lý bởi collect bên trên (Lazy)
     }
 
     fun saveLegacy(newName: String) {
@@ -257,27 +249,31 @@ class DemoViewModel(
     fun readStrategyRAM() {
         viewModelScope.launch(Dispatchers.Default) {
             isFetching.value = true
-            addLog("RAM Test: Đang nạp 6,000 đối tượng LỒNG NHAU vào RAM...")
+            addLog("RAM Test: Đang nạp 10,000 đối tượng LỒNG NHAU vào RAM...")
 
-            val longStr = "Dữ liệu lồng nhau rất nặng nề... ".repeat(30)
-            if (memoryStorage.isEmpty()) {
-                repeat(6000) { i ->
+            try {
+                repeat(10000) { i ->
+                    // Ép tạo chuỗi mới hoàn toàn bằng UUID để tránh bị tối ưu hóa (String Interning)
+                    val uniqueStr = UUID.randomUUID().toString() + " ".repeat(1000) 
+                    
+                    val h = Hotel(UUID.randomUUID().toString(), "Hotel $i", (100000..2000000).random(), uniqueStr)
                     memoryStorage.add(HotelComplex(
-                        Hotel(i.toString(), "Heavy Hotel $i", (100000..2000000).random(), longStr),
-                        List(5) { "Phòng loại $it: $longStr" },
-                        List(10) { "Review từ khách $it: $longStr" }
+                        hotel = h,
+                        roomTypes = List(3) { RoomType(hotelId = h.id, typeName = "Type $it", info = uniqueStr) },
+                        reviews = List(5) { Review(hotelId = h.id, user = "User $it", comment = uniqueStr) }
                     ))
                 }
+                
+                val startTime = System.currentTimeMillis()
+                val filtered = memoryStorage.filter { it.hotel.price < 1000000 }
+                val endTime = System.currentTimeMillis()
+
+                fetchSource.value = "RAM (Leaking...)"
+                val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                logs.value = listOf("[$time] RAM: Hiện có ${memoryStorage.size} đối tượng độc lập. Lọc mất ${endTime - startTime}ms.") + logs.value
+            } catch (e: OutOfMemoryError) {
+                addLog("CRASH: OutOfMemory! RAM đã cạn kiệt.")
             }
-            val startTime = System.currentTimeMillis()
-            val filtered = memoryStorage.filter { it.hotel.price < 1000000 }
-            val endTime = System.currentTimeMillis()
-
-            fetchSource.value = "RAM (Complex Objects)"
-            val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-            val resultsLogs = filtered.map { "[$time] RAM Result: ${it.hotel.name} - ${it.hotel.price}đ" }
-
-            logs.value = listOf("[$time] RAM: Đã duyệt 6,000 đối tượng lồng nhau trong ${endTime - startTime}ms.") + resultsLogs + logs.value
             isFetching.value = false
         }
     }
@@ -288,14 +284,13 @@ class DemoViewModel(
             val online = checkOnline()
             if (!online) {
                 val startTime = System.currentTimeMillis()
-                val rooms = hotelDao.getCheapRooms()
+                // Room thực hiện JOIN các bảng để lấy cấu trúc phức tạp
+                val results = hotelDao.getCheapHotelsWithDetails()
                 val endTime = System.currentTimeMillis()
-                fetchSource.value = "LOCAL (Room DB)"
+                fetchSource.value = "LOCAL (Room - Structured)"
 
                 val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                val resultsLogs = rooms.map { "[$time] Disk Result: ${it.name} - ${it.price}đ" }
-
-                logs.value = listOf("[$time] Disk: Lấy ${rooms.size} Hotel từ Room trong ${endTime - startTime}ms.") + resultsLogs + logs.value
+                logs.value = listOf("[$time] Disk: Lấy ${results.size} Hotel cấu trúc phức tạp từ Room trong ${endTime - startTime}ms.") + logs.value
             } else {
                 fetchSource.value = "REMOTE (Cloud API)"
                 addLog("Online: Đang tải dữ liệu từ Server...")
@@ -305,11 +300,51 @@ class DemoViewModel(
             isFetching.value = false
         }
     }
+
+    // 1. Online-only Write: Chỉ cho phép khi có mạng
+    fun onlineOnlyWritePayment() {
+        viewModelScope.launch {
+            if (checkOnline()) {
+                addLog("Online-only: Đang xử lý thanh toán...")
+                delay(1500)
+                addLog("Thành công: Đã thanh toán trực tuyến.")
+            } else {
+                addLog("Lỗi: Không có mạng. Tác vụ thanh toán bị hủy để bảo mật.")
+            }
+        }
+    }
+
+    // 2. Queued Write with Exponential Backoff
+    fun writeStrategyQueued() {
+        // Hủy worker cũ nếu có để demo lại từ đầu
+        workManager.cancelAllWorkByTag("sync_demo")
+
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val work = OneTimeWorkRequestBuilder<SyncFavoriteWorker>()
+            .setConstraints(constraints)
+            .addTag("sync_demo")
+            .setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                2,
+                TimeUnit.SECONDS
+            )
+            .build()
+
+        workManager.enqueue(work)
+        addLog("Queued: Đã bắt đầu Task với Exponential Backoff (2s, 4s, 8s...).")
+    }
+
+    //3. Lazy
+    fun updateVideoProgress(progress: Float) {
+        videoProgress.value = progress
+        // Lưu local ngay lập tức (nhanh)
+        // syncToServer sẽ được xử lý bởi collect bên trên (Lazy)
+    }
 }
 
-// =====================================================================
-// UI
-// =====================================================================
 @Composable
 fun AppUI(viewModel: DemoViewModel) {
     val logs by viewModel.logs.collectAsState()
@@ -402,7 +437,11 @@ fun AppUI(viewModel: DemoViewModel) {
                             }
                             Text("Số lần thử (Run Attempt): ${info.runAttemptCount}", style = MaterialTheme.typography.bodySmall)
                             if (info.state == WorkInfo.State.ENQUEUED && info.runAttemptCount > 0) {
-                                Text("Đang chờ thử lại (Backoff waiting...)", color = Color.Red, fontSize = 9.sp)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Đang chờ thử lại (Backoff)...", color = Color(0xFFF57C00), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                    Spacer(Modifier.width(4.dp))
+                                    CircularProgressIndicator(modifier = Modifier.size(8.dp), strokeWidth = 1.dp, color = Color(0xFFF57C00))
+                                }
                             }
                         }
                     }
