@@ -53,7 +53,7 @@ data class Hotel(
     @PrimaryKey @ColumnInfo(name = "id") val id: String,
     @ColumnInfo(name = "name") val name: String,
     @ColumnInfo(name = "price") val price: Int,
-    @ColumnInfo(name = "description") val description: String // Chuỗi dài để tốn RAM
+    @ColumnInfo(name = "description") val description: String
 )
 
 @Entity(tableName = "room_types")
@@ -61,7 +61,7 @@ data class RoomType(
     @PrimaryKey(autoGenerate = true) val rtId: Int = 0,
     val hotelId: String,
     val typeName: String,
-    val info: String // Thông tin chi tiết loại phòng
+    val info: String
 )
 
 @Entity(tableName = "reviews")
@@ -69,7 +69,7 @@ data class Review(
     @PrimaryKey(autoGenerate = true) val revId: Int = 0,
     val hotelId: String,
     val user: String,
-    val comment: String // Bình luận dài
+    val comment: String
 )
 
 //STRUCTURED DATA MODELS FOR ROOM
@@ -89,6 +89,9 @@ data class HotelWithDetails(
 
 @Dao
 interface HotelDao {
+    @Query("SELECT COUNT(*) FROM hotels")
+    suspend fun getCount(): Int
+
     @Transaction
     @Query("SELECT * FROM hotels WHERE price < 1000000")
     suspend fun getCheapHotelsWithDetails(): List<HotelWithDetails>
@@ -174,24 +177,28 @@ class DemoViewModel(
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
+            val currentCount = hotelDao.getCount()
+            if (currentCount > 0) {
+                addLog("Disk: Đã có $currentCount bản ghi. Không nạp thêm (Ưu điểm của Room: Dữ liệu tồn tại vĩnh viễn trên ổ đĩa).")
+                return@launch
+            }
 
-            addLog("Đang chuẩn bị 10,000 Hotel ngẫu nhiên trên Disk (vui lòng đợi)...")
+            addLog("Disk: Đang nạp 100 Hotel mẫu (lần đầu khởi tạo)...")
             val startTime = System.currentTimeMillis()
             
-            // Đồng bộ lên 10,000 khách sạn cho Room với dữ liệu ngẫu nhiên cực nặng
             val hotels = mutableListOf<Hotel>()
             val types = mutableListOf<RoomType>()
             val reviews = mutableListOf<Review>()
 
-            repeat(10000) { i ->
-                val uniqueStr = UUID.randomUUID().toString() + " ".repeat(1000)
-                val hId = UUID.randomUUID().toString()
+            repeat(100) { i ->
+                val uniqueStr = "Mô tả của khách sạn $i " + UUID.randomUUID().toString().take(8)
+                val hId = UUID.randomUUID().toString().take(8)
                 
                 val hotel = Hotel(hId, "Hotel $i", (500000..1500000).random(), uniqueStr)
                 hotels.add(hotel)
                 
-                repeat(3) { types.add(RoomType(hotelId = hId, typeName = "Type $it", info = uniqueStr)) }
-                repeat(5) { reviews.add(Review(hotelId = hId, user = "User $it", comment = uniqueStr)) }
+                repeat(2) { types.add(RoomType(hotelId = hId, typeName = "Loại $it", info = "Phòng $it của $hId")) }
+                repeat(2) { reviews.add(Review(hotelId = hId, user = "User $it", comment = "Review $it cho $hId")) }
             }
 
             hotelDao.insertHotels(hotels)
@@ -199,7 +206,7 @@ class DemoViewModel(
             hotelDao.insertReviews(reviews)
             
             val endTime = System.currentTimeMillis()
-            addLog("Xong! Đã lưu 90,000 bản ghi ĐỘC LẬP vào Room trong ${endTime - startTime}ms.")
+            addLog("Xong! Đã lưu 100 khách sạn vào Room trong ${endTime - startTime}ms.")
         }
 
         // Hiện thực Lazy Write: Gom các thay đổi và đồng bộ sau 3 giây không có thay đổi mới (Debounce)
@@ -249,30 +256,34 @@ class DemoViewModel(
     fun readStrategyRAM() {
         viewModelScope.launch(Dispatchers.Default) {
             isFetching.value = true
-            addLog("RAM Test: Đang nạp 10,000 đối tượng LỒNG NHAU vào RAM...")
+            memoryStorage.clear() // Xóa cũ để nạp mới
+            addLog("RAM Test: Đang nạp 100 đối tượng vào RAM...")
 
             try {
-                repeat(10000) { i ->
-                    // Ép tạo chuỗi mới hoàn toàn bằng UUID để tránh bị tối ưu hóa (String Interning)
-                    val uniqueStr = UUID.randomUUID().toString() + " ".repeat(1000) 
-                    
-                    val h = Hotel(UUID.randomUUID().toString(), "Hotel $i", (100000..2000000).random(), uniqueStr)
-                    memoryStorage.add(HotelComplex(
+                repeat(100) { i ->
+                    val hId = "RAM_$i"
+                    val h = Hotel(hId, "RAM Hotel $i", (100000..2000000).random(), "RAM Data $i")
+                    val complex = HotelComplex(
                         hotel = h,
-                        roomTypes = List(3) { RoomType(hotelId = h.id, typeName = "Type $it", info = uniqueStr) },
-                        reviews = List(5) { Review(hotelId = h.id, user = "User $it", comment = uniqueStr) }
-                    ))
+                        roomTypes = List(2) { RoomType(hotelId = hId, typeName = "Type $it", info = "Info $it") },
+                        reviews = List(2) { Review(hotelId = hId, user = "User $it", comment = "Comment $it") }
+                    )
+                    memoryStorage.add(complex)
                 }
                 
                 val startTime = System.currentTimeMillis()
                 val filtered = memoryStorage.filter { it.hotel.price < 1000000 }
                 val endTime = System.currentTimeMillis()
 
-                fetchSource.value = "RAM (Leaking...)"
-                val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                logs.value = listOf("[$time] RAM: Hiện có ${memoryStorage.size} đối tượng độc lập. Lọc mất ${endTime - startTime}ms.") + logs.value
-            } catch (e: OutOfMemoryError) {
-                addLog("CRASH: OutOfMemory! RAM đã cạn kiệt.")
+                fetchSource.value = "RAM"
+                addLog("RAM: Đã lọc ${filtered.size} khách sạn < 1tr trong ${endTime - startTime}ms.")
+                
+                // Log chi tiết từng object
+                filtered.forEach { 
+                    addLog("-> [RAM] ${it.hotel.name}: ${it.hotel.price}đ (ID: ${it.hotel.id})")
+                }
+            } catch (e: Exception) {
+                addLog("Lỗi RAM: ${e.message}")
             }
             isFetching.value = false
         }
@@ -284,13 +295,15 @@ class DemoViewModel(
             val online = checkOnline()
             if (!online) {
                 val startTime = System.currentTimeMillis()
-                // Room thực hiện JOIN các bảng để lấy cấu trúc phức tạp
                 val results = hotelDao.getCheapHotelsWithDetails()
                 val endTime = System.currentTimeMillis()
-                fetchSource.value = "LOCAL (Room - Structured)"
+                fetchSource.value = "LOCAL (Room)"
 
-                val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                logs.value = listOf("[$time] Disk: Lấy ${results.size} Hotel cấu trúc phức tạp từ Room trong ${endTime - startTime}ms.") + logs.value
+                addLog("Disk: Lấy ${results.size} Hotel < 1tr từ Room trong ${endTime - startTime}ms.")
+                // Log chi tiết từng object
+                results.forEach {
+                    addLog("-> [Room] ${it.hotel.name}: ${it.hotel.price}đ - ${it.roomTypes.size} loại phòng")
+                }
             } else {
                 fetchSource.value = "REMOTE (Cloud API)"
                 addLog("Online: Đang tải dữ liệu từ Server...")
